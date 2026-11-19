@@ -15,12 +15,14 @@ pairing info (pubkey/host/port), and the private key never leaves the machine.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import sqlite3
 import threading
 import time
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 
 #
@@ -76,18 +78,51 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
+    def _trusted_request(self) -> bool:
+        """Reject remote callers, hostile Host headers (DNS rebinding), and cross-site origins.
+
+        Loopback binding alone is not an authorization boundary for a browser console.
+        A Host with an unexpected name or port must not be able to read task history or
+        reopen the device pairing window.
+        """
+        try:
+            if not ipaddress.ip_address(self.client_address[0]).is_loopback:
+                return False
+            host = self.headers.get("Host", "")
+            parsed = urlsplit("http://" + host)
+            if parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+                return False
+            if parsed.port != self.server.server_address[1]:
+                return False
+            if parsed.username is not None or parsed.password is not None or parsed.path:
+                return False
+            origin = self.headers.get("Origin")
+            if origin:
+                source = urlsplit(origin)
+                if source.scheme != "http" or source.netloc.lower() != host.lower():
+                    return False
+            return True
+        except (ValueError, TypeError):
+            return False
+
     def do_GET(self):  # noqa: N802 — http.server interface
+        if not self._trusted_request():
+            self._send(403, "application/json; charset=utf-8", b'{"ok":false,"err":"untrusted origin"}')
+            return
         if self.path == "/" or self.path.startswith("/index"):
             self._send(200, "text/html; charset=utf-8", _PAGE.encode("utf-8"))
         elif self.path.startswith("/api/status"):
             body = json.dumps(self._status(), ensure_ascii=False).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", body)
         elif self.path.startswith("/api/open-pairing"):
-            self.broker.open_pairing(300)  # one-click reopen of the pairing window from the GUI (for switching devices / after expiry)
-            self._send(200, "application/json; charset=utf-8", b'{"ok":true}')
+            # A GET can be triggered cross-site by <img>, <script>, links, etc.
+            # Pairing is state-changing and must never be reachable through GET.
+            self._send(405, "application/json; charset=utf-8", b'{"ok":false,"err":"POST required"}')
         else:
             self._send(404, "text/plain; charset=utf-8", b"not found")
 
@@ -106,9 +141,16 @@ class _Handler(BaseHTTPRequestHandler):
         這兩道都不是密碼學保證，但對「本機 GUI 的撤銷按鈕」這個威脅模型足夠：
         真正能繞過的人已經在這台機器上執行程式碼了。
         """
+        if not self._trusted_request():
+            self._send(403, "application/json; charset=utf-8", b'{"ok":false,"err":"untrusted origin"}')
+            return
         if self.headers.get("X-Hermes-Console") != "1":
             self._send(403, "application/json; charset=utf-8",
                        b'{"ok":false,"err":"missing console header"}')
+            return
+        if self.path == "/api/open-pairing":
+            self.broker.open_pairing(300)
+            self._send(200, "application/json; charset=utf-8", b'{"ok":true}')
             return
         if not self.path.startswith("/api/unpair"):
             self._send(404, "text/plain; charset=utf-8", b"not found")
@@ -541,7 +583,7 @@ function fmtTime(t){ if(!t) return '—'; const d=new Date(t*1000);
   return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); }
 function escapeHtml(s){ return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function toggle(i){ const d=document.getElementById('d'+i); if(d) d.style.display = d.style.display==='none'?'':'none'; }
-async function openPairing(){ try{ await fetch('/api/open-pairing'); }catch(e){} tick(); }
+async function openPairing(){ try{ await fetch('/api/open-pairing',{method:'POST',headers:{'X-Hermes-Console':'1'}}); }catch(e){} tick(); }
 let lastTasksJson='';
 function renderTasks(tasks){
   const tb = document.getElementById('tasks');
