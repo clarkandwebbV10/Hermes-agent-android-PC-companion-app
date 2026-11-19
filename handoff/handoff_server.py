@@ -23,7 +23,7 @@ import json
 import socket
 import struct
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import nacl.public
@@ -130,12 +130,14 @@ class HandoffServer:
     _sock: Optional[socket.socket] = None
     _thread: Optional[threading.Thread] = None
     _running: bool = False
+    _connection_slots: threading.BoundedSemaphore = field(default_factory=lambda: threading.BoundedSemaphore(32), repr=False)
     _zc = None  # zeroconf instance
 
     def _handle(self, conn: socket.socket):
         try:
-            # handshake: client sends {did, pk} in cleartext
-            hello = json.loads(_recv_frame(conn).decode("utf-8"))
+            conn.settimeout(15.0)  # Prevent stalled unauthenticated LAN connections from persisting indefinitely.
+            # Handshake is a tiny JSON object. Never allocate 64 MiB for it.
+            hello = json.loads(_recv_frame(conn, max_len=4096).decode("utf-8"))
             cdid = hello["did"]
             cpk = pr._b64d(hello["pk"])
             if not self.peers.is_paired(cdid, cpk):
@@ -144,7 +146,7 @@ class HandoffServer:
             _send_frame(conn, json.dumps({"ok": True, "proto": PROTO}).encode())
 
             # client sends a request encrypted with Box(client_sk→server_pk) → server decrypts = authenticates the client
-            req_blob = _recv_frame(conn)
+            req_blob = _recv_frame(conn, max_len=64 * 1024)  # Only a session_id request; bundles travel server -> phone.
             req = json.loads(pr.box_decrypt(self.identity.private_key, cpk, req_blob))
             session_id = req["session_id"]
 
@@ -180,7 +182,20 @@ class HandoffServer:
                     conn, _ = self._sock.accept()
                 except OSError:
                     break
-                threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+                if not self._connection_slots.acquire(blocking=False):
+                    conn.close()  # Limit unauthenticated connection-thread exhaustion.
+                    continue
+                def serve_one(client):
+                    try:
+                        self._handle(client)
+                    finally:
+                        self._connection_slots.release()
+                try:
+                    threading.Thread(target=serve_one, args=(conn,), daemon=True).start()
+                except Exception:
+                    self._connection_slots.release()
+                    conn.close()
+                    raise
 
         self._thread = threading.Thread(target=loop, daemon=True)
         self._thread.start()
