@@ -67,9 +67,61 @@ def _read_history(db_path: str, limit: int = 20):
         conn.close()
 
 
+MAX_CONSOLE_BODY = 4096
+CONSOLE_IDLE_TIMEOUT = 10
+CONSOLE_BODY_DEADLINE = 10
+MAX_CONSOLE_CLIENTS = 16
+
+
+class _BoundedConsoleServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        self._slots = threading.BoundedSemaphore(MAX_CONSOLE_CLIENTS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
 class _Handler(BaseHTTPRequestHandler):
     broker = None  # injected via partial
     session = None  # --session：有值時主控台顯示 handoff QR 而非純配對 QR
+
+    def setup(self):
+        self.request.settimeout(CONSOLE_IDLE_TIMEOUT)
+        super().setup()
+
+    def _read_body(self, size):
+        deadline = time.monotonic() + CONSOLE_BODY_DEADLINE
+        chunks = []
+        try:
+            while size:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Body deadline")
+                self.connection.settimeout(min(remaining, CONSOLE_IDLE_TIMEOUT))
+                chunk = self.rfile.read1(min(size, 4096))
+                if not chunk:
+                    raise ConnectionError("Incomplete body")
+                chunks.append(chunk)
+                size -= len(chunk)
+            return b"".join(chunks)
+        finally:
+            self.connection.settimeout(CONSOLE_IDLE_TIMEOUT)
 
     def log_message(self, *a):  # noqa: A002 — silence the access log
         pass
@@ -148,18 +200,36 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(403, "application/json; charset=utf-8",
                        b'{"ok":false,"err":"missing console header"}')
             return
+        lengths = self.headers.get_all("Content-Length", [])
+        if self.headers.get("Transfer-Encoding") is not None or len(lengths) > 1:
+            self.close_connection = True
+            return self._send(400, "application/json; charset=utf-8", b'{"ok":false,"err":"invalid body framing"}')
+        try:
+            n = int(lengths[0]) if lengths else 0
+        except (ValueError, OverflowError):
+            n = -1
+        if not 0 <= n <= MAX_CONSOLE_BODY:
+            self.close_connection = True
+            return self._send(413, "application/json; charset=utf-8", b'{"ok":false,"err":"body size limit"}')
         if self.path == "/api/open-pairing":
+            if n != 0:
+                self.close_connection = True
+                return self._send(400, "application/json; charset=utf-8", b'{"ok":false,"err":"unexpected body"}')
             self.broker.open_pairing(300)
             self._send(200, "application/json; charset=utf-8", b'{"ok":true}')
             return
-        if not self.path.startswith("/api/unpair"):
+        if self.path != "/api/unpair":
             self._send(404, "text/plain; charset=utf-8", b"not found")
             return
         try:
-            n = int(self.headers.get("Content-Length") or 0)
-            body = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
-            did = str(body.get("did") or "")
-        except (ValueError, OSError):
+            body = json.loads(self._read_body(n).decode("utf-8")) if n else {}
+            if not isinstance(body, dict):
+                raise ValueError("object required")
+            did = body.get("did", "")
+            if not isinstance(did, str) or len(did) > 256:
+                raise ValueError("invalid device identity")
+        except (ValueError, OSError, RecursionError):
+            self.close_connection = True
             self._send(400, "application/json; charset=utf-8", b'{"ok":false,"err":"bad body"}')
             return
         removed = bool(did) and self.broker.peers.remove(did)
@@ -204,7 +274,9 @@ def serve_web(broker, host: str = "127.0.0.1", port: int = 0, session: str | Non
     # 單一 broker 行程，設在類別上就夠。
     _Handler.broker = broker
     _Handler.session = session
-    httpd = ThreadingHTTPServer((host, port), _Handler)
+    if not ipaddress.ip_address(host).is_loopback:
+        raise ValueError("Companion console requires a numeric loopback bind")
+    httpd = _BoundedConsoleServer((host, port), _Handler)
     actual_port = httpd.server_address[1]
     threading.Thread(target=httpd.serve_forever, name="companion-web", daemon=True).start()
     return host, actual_port
