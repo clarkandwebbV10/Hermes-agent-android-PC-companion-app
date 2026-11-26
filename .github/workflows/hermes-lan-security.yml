@@ -1,0 +1,29 @@
+name: hermes-lan-security-regressions
+
+on:
+  push:
+    branches:
+      - security/lan-framing-bounds-20261119
+  pull_request:
+    paths:
+      - "handoff/mesh_broker.py"
+      - "handoff/handoff_server.py"
+      - "handoff/tests/test_lan_limits.py"
+      - ".github/workflows/hermes-lan-security.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  lan-security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install bounded test prerequisites
+        run: python -m pip install pytest "PyNaCl>=1.5" "zeroconf>=0.130"
+      - name: Run real loopback TCP tests and existing broker tests
+        run: python -m pytest -q handoff/tests/test_lan_limits.py handoff/tests/test_mesh_broker.py handoff/tests/test_pairing.py

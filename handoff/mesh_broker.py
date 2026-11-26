@@ -184,6 +184,7 @@ class MeshBroker:
     _zc = None
     _zc_info = None
     _pairing_until: float = 0.0   # pairing-window expiry timestamp (time.time()); before this, not open
+    _connection_slots: threading.BoundedSemaphore = field(default_factory=lambda: threading.BoundedSemaphore(32), repr=False)
 
     # ---- pairing window ----
     def open_pairing(self, window_sec: int = 300) -> None:
@@ -201,7 +202,8 @@ class MeshBroker:
             _peer = "?"
         cdid = None   # 先給值：例外若發生在賦值之前，except 內引用它會變成 NameError 蓋掉真錯
         try:
-            hello = json.loads(hs._recv_frame(conn).decode("utf-8"))
+            conn.settimeout(15.0)  # Per socket-read timeout; preserves long transfers when data flows.
+            hello = json.loads(hs._recv_frame(conn, max_len=4096).decode("utf-8"))
             cdid, cpk = hello["did"], pr._b64d(hello["pk"])
             paired = self.peers.is_paired(cdid, cpk)
             # Unpaired: only allowed to continue while the pairing window is open (to run the pair op); otherwise reject.
@@ -225,7 +227,11 @@ class MeshBroker:
             # Encrypted request: a successful box_decrypt(broker_sk, cpk) means the peer holds the private
             # key for cpk (authenticating that public key) and encrypted to broker_pk (proving it scanned
             # the QR to obtain the broker public key). pair establishes trust on these two points + the time window.
-            req = json.loads(pr.box_decrypt(self.identity.private_key, cpk, hs._recv_frame(conn)))
+            # Unpaired devices are only allowed a small encrypted pairing request.
+            # Paired phones may upload larger, encrypted session bundles (<=64 MiB).
+            inbound_limit = 64 * 1024 * 1024 if paired else 16 * 1024
+            req = json.loads(pr.box_decrypt(self.identity.private_key, cpk,
+                                            hs._recv_frame(conn, max_len=inbound_limit)))
             op = req.get("op")
             if op != "poll":  # poll runs every few seconds, too frequent — don't print to avoid spam; keep a diagnostic trail for other ops
                 print(f"[mesh] ← {_peer} did={cdid[:8]} op={op} paired={paired}", flush=True)
@@ -412,7 +418,20 @@ class MeshBroker:
                     conn, _ = self._sock.accept()
                 except OSError:
                     break
-                threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+                if not self._connection_slots.acquire(blocking=False):
+                    conn.close()  # No unbounded per-connection threads on a LAN listener.
+                    continue
+                def serve_one(client):
+                    try:
+                        self._handle(client)
+                    finally:
+                        self._connection_slots.release()
+                try:
+                    threading.Thread(target=serve_one, args=(conn,), daemon=True).start()
+                except Exception:
+                    self._connection_slots.release()
+                    conn.close()
+                    raise
 
         threading.Thread(target=accept_loop, name="mesh-accept", daemon=True).start()
         self._worker = threading.Thread(target=self._worker_loop, name="mesh-worker", daemon=True)
