@@ -94,3 +94,25 @@ def test_sensitive_status_disables_caching(console):
     assert status == 200
     assert headers["Cache-Control"] == "no-store"
     assert headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_unpair_rejects_non_object_and_oversized_body(console):
+    broker, url = console
+    for body, expected in [(b'[]', 400), (b'{"did":42}', 400),
+                           (b' ' * 4097, 413)]:
+        req = urllib.request.Request(url + "/api/unpair", method="POST",
+            data=body, headers={"X-Hermes-Console":"1", "Content-Type":"application/json"})
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(req, timeout=5)
+        assert caught.value.code == expected
+    assert not broker._pairing_open()
+
+
+def test_pairing_rejects_unexpected_body(console):
+    broker, url = console
+    req = urllib.request.Request(url + "/api/open-pairing", method="POST", data=b'{}',
+        headers={"X-Hermes-Console":"1", "Content-Type":"application/json"})
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        urllib.request.urlopen(req, timeout=5)
+    assert caught.value.code == 400
+    assert not broker._pairing_open()
