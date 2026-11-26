@@ -15,12 +15,14 @@ pairing info (pubkey/host/port), and the private key never leaves the machine.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import sqlite3
 import threading
 import time
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 
 #
@@ -65,9 +67,61 @@ def _read_history(db_path: str, limit: int = 20):
         conn.close()
 
 
+MAX_CONSOLE_BODY = 4096
+CONSOLE_IDLE_TIMEOUT = 10
+CONSOLE_BODY_DEADLINE = 10
+MAX_CONSOLE_CLIENTS = 16
+
+
+class _BoundedConsoleServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        self._slots = threading.BoundedSemaphore(MAX_CONSOLE_CLIENTS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
 class _Handler(BaseHTTPRequestHandler):
     broker = None  # injected via partial
     session = None  # --session：有值時主控台顯示 handoff QR 而非純配對 QR
+
+    def setup(self):
+        self.request.settimeout(CONSOLE_IDLE_TIMEOUT)
+        super().setup()
+
+    def _read_body(self, size):
+        deadline = time.monotonic() + CONSOLE_BODY_DEADLINE
+        chunks = []
+        try:
+            while size:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Body deadline")
+                self.connection.settimeout(min(remaining, CONSOLE_IDLE_TIMEOUT))
+                chunk = self.rfile.read1(min(size, 4096))
+                if not chunk:
+                    raise ConnectionError("Incomplete body")
+                chunks.append(chunk)
+                size -= len(chunk)
+            return b"".join(chunks)
+        finally:
+            self.connection.settimeout(CONSOLE_IDLE_TIMEOUT)
 
     def log_message(self, *a):  # noqa: A002 — silence the access log
         pass
@@ -76,18 +130,51 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
+    def _trusted_request(self) -> bool:
+        """Reject remote callers, hostile Host headers (DNS rebinding), and cross-site origins.
+
+        Loopback binding alone is not an authorization boundary for a browser console.
+        A Host with an unexpected name or port must not be able to read task history or
+        reopen the device pairing window.
+        """
+        try:
+            if not ipaddress.ip_address(self.client_address[0]).is_loopback:
+                return False
+            host = self.headers.get("Host", "")
+            parsed = urlsplit("http://" + host)
+            if parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+                return False
+            if parsed.port != self.server.server_address[1]:
+                return False
+            if parsed.username is not None or parsed.password is not None or parsed.path:
+                return False
+            origin = self.headers.get("Origin")
+            if origin:
+                source = urlsplit(origin)
+                if source.scheme != "http" or source.netloc.lower() != host.lower():
+                    return False
+            return True
+        except (ValueError, TypeError):
+            return False
+
     def do_GET(self):  # noqa: N802 — http.server interface
+        if not self._trusted_request():
+            self._send(403, "application/json; charset=utf-8", b'{"ok":false,"err":"untrusted origin"}')
+            return
         if self.path == "/" or self.path.startswith("/index"):
             self._send(200, "text/html; charset=utf-8", _PAGE.encode("utf-8"))
         elif self.path.startswith("/api/status"):
             body = json.dumps(self._status(), ensure_ascii=False).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", body)
         elif self.path.startswith("/api/open-pairing"):
-            self.broker.open_pairing(300)  # one-click reopen of the pairing window from the GUI (for switching devices / after expiry)
-            self._send(200, "application/json; charset=utf-8", b'{"ok":true}')
+            # A GET can be triggered cross-site by <img>, <script>, links, etc.
+            # Pairing is state-changing and must never be reachable through GET.
+            self._send(405, "application/json; charset=utf-8", b'{"ok":false,"err":"POST required"}')
         else:
             self._send(404, "text/plain; charset=utf-8", b"not found")
 
@@ -106,18 +193,43 @@ class _Handler(BaseHTTPRequestHandler):
         這兩道都不是密碼學保證，但對「本機 GUI 的撤銷按鈕」這個威脅模型足夠：
         真正能繞過的人已經在這台機器上執行程式碼了。
         """
+        if not self._trusted_request():
+            self._send(403, "application/json; charset=utf-8", b'{"ok":false,"err":"untrusted origin"}')
+            return
         if self.headers.get("X-Hermes-Console") != "1":
             self._send(403, "application/json; charset=utf-8",
                        b'{"ok":false,"err":"missing console header"}')
             return
-        if not self.path.startswith("/api/unpair"):
+        lengths = self.headers.get_all("Content-Length", [])
+        if self.headers.get("Transfer-Encoding") is not None or len(lengths) > 1:
+            self.close_connection = True
+            return self._send(400, "application/json; charset=utf-8", b'{"ok":false,"err":"invalid body framing"}')
+        try:
+            n = int(lengths[0]) if lengths else 0
+        except (ValueError, OverflowError):
+            n = -1
+        if not 0 <= n <= MAX_CONSOLE_BODY:
+            self.close_connection = True
+            return self._send(413, "application/json; charset=utf-8", b'{"ok":false,"err":"body size limit"}')
+        if self.path == "/api/open-pairing":
+            if n != 0:
+                self.close_connection = True
+                return self._send(400, "application/json; charset=utf-8", b'{"ok":false,"err":"unexpected body"}')
+            self.broker.open_pairing(300)
+            self._send(200, "application/json; charset=utf-8", b'{"ok":true}')
+            return
+        if self.path != "/api/unpair":
             self._send(404, "text/plain; charset=utf-8", b"not found")
             return
         try:
-            n = int(self.headers.get("Content-Length") or 0)
-            body = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
-            did = str(body.get("did") or "")
-        except (ValueError, OSError):
+            body = json.loads(self._read_body(n).decode("utf-8")) if n else {}
+            if not isinstance(body, dict):
+                raise ValueError("object required")
+            did = body.get("did", "")
+            if not isinstance(did, str) or len(did) > 256:
+                raise ValueError("invalid device identity")
+        except (ValueError, OSError, RecursionError):
+            self.close_connection = True
             self._send(400, "application/json; charset=utf-8", b'{"ok":false,"err":"bad body"}')
             return
         removed = bool(did) and self.broker.peers.remove(did)
@@ -162,7 +274,9 @@ def serve_web(broker, host: str = "127.0.0.1", port: int = 0, session: str | Non
     # 單一 broker 行程，設在類別上就夠。
     _Handler.broker = broker
     _Handler.session = session
-    httpd = ThreadingHTTPServer((host, port), _Handler)
+    if not ipaddress.ip_address(host).is_loopback:
+        raise ValueError("Companion console requires a numeric loopback bind")
+    httpd = _BoundedConsoleServer((host, port), _Handler)
     actual_port = httpd.server_address[1]
     threading.Thread(target=httpd.serve_forever, name="companion-web", daemon=True).start()
     return host, actual_port
@@ -541,7 +655,7 @@ function fmtTime(t){ if(!t) return '—'; const d=new Date(t*1000);
   return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); }
 function escapeHtml(s){ return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function toggle(i){ const d=document.getElementById('d'+i); if(d) d.style.display = d.style.display==='none'?'':'none'; }
-async function openPairing(){ try{ await fetch('/api/open-pairing'); }catch(e){} tick(); }
+async function openPairing(){ try{ await fetch('/api/open-pairing',{method:'POST',headers:{'X-Hermes-Console':'1'}}); }catch(e){} tick(); }
 let lastTasksJson='';
 function renderTasks(tasks){
   const tb = document.getElementById('tasks');
